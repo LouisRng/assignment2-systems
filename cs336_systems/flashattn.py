@@ -88,7 +88,7 @@ def flash_fwd_kernel(
     O_block_ptr = tl.make_block_ptr(
         O_ptr + batch_index * stride_ob,
         shape=(N_QUERIES, D),
-        stride=(stride_oq, stride_od),
+        strides=(stride_oq, stride_od),
         offsets=(query_tile_index * Q_TILE_SIZE, 0),
         block_shape=(Q_TILE_SIZE, D),
         order=(1, 0), 
@@ -97,29 +97,37 @@ def flash_fwd_kernel(
     L_block_ptr = tl.make_block_ptr(
         L_ptr + batch_index * stride_lb,
         shape=(N_QUERIES,),
-        stride=(stride_lq,),
+        strides=(stride_lq,),
         offsets=(query_tile_index * Q_TILE_SIZE,),
         block_shape=(Q_TILE_SIZE,),
         order=(0,),
     )
+    Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
     l = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
     m = tl.full((Q_TILE_SIZE,), -float('inf'), dtype=tl.float32)
-    O = tl.full((Q_TILE_SIZE, D), -float('inf'), dtype=tl.float32)
+    O = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
     for i in range(tl.cdiv(N_QUERIES, K_TILE_SIZE)):
-        K = tl.load(K_ptr, boundary_check=(0, 1), padding_option="zero")
-        V = tl.load(V_ptr, boundary_check=(0, 1), padding_option="zero")
+        K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
         S = tl.dot(Q, K) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
         m_blk = tl.maximum(m, tl.max(S, axis=-1)) # (Q_TILE_SIZE,)
         P = tl.exp(S - m_blk[:, None]) # (Q_TILE_SIZE, K_TILE_SIZE)
         l = tl.exp(m - m_blk) * l + tl.sum(P, axis=-1) # (Q_TILE_SIZE,)
+        tl.static_print("Q_TILE_SIZE: ", Q_TILE_SIZE)
+        tl.static_print("K_TILE_SIZE: ", K_TILE_SIZE)
+        tl.static_print("P.shape: ", P.shape)
+        tl.static_print("V.shape: ", V.shape)
+        tl.static_print("m.shape: ", m.shape)
+        tl.static_print("m_blk.shape: ", m_blk.shape)
+        tl.static_print("O.shape: ", O.shape)
         O = tl.exp(m - m_blk)[:, None] * O + tl.dot(P, V) # (Q_TILE_SIZE, D)
         m = m_blk
 
-        K_ptr = K_ptr.advance((K_TILE_SIZE, 0))
-        V_ptr = V_ptr.advance((K_TILE_SIZE, 0))
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     L = m + tl.log(l) # (Q_TILE_SIZE,)
-    tl.store(O_block_ptr, O, boundary_check(0, 1))
-    tl.store(L_block_ptr, L, boundary_check(0,))
+    tl.store(O_block_ptr, O, boundary_check=(0, 1))
+    tl.store(L_block_ptr, L, boundary_check=(0,))
         
         
     
@@ -132,10 +140,11 @@ class MyTritonFlashAttentionAutogradFunctionClass(torch.autograd.Function):
         b, N_QUERIES, D = Q.shape
         _, N_KEYS, _ = K.shape
         scale = D ** -0.5
-        ctx.Q_TILE_SIZE = triton.next_power_of_2(D) // 16
-        ctx.K_TILE_SIZE = triton.next_power_of_2(D) // 16
+        ctx.Q_TILE_SIZE = triton.next_power_of_2(N_QUERIES) // 4
+        ctx.K_TILE_SIZE = triton.next_power_of_2(N_KEYS) // 4
         O = torch.zeros((b, N_QUERIES, D), device=Q.device, dtype=Q.dtype)
         L = torch.empty((b, N_QUERIES), device=Q.device, dtype=Q.dtype)
+        ctx.save_for_backward(L, Q, K, V, O)
         flash_fwd_kernel[triton.cdiv(N_QUERIES, ctx.Q_TILE_SIZE), b](
             Q, K, V, O, L,
             Q.stride(0), Q.stride(1), Q.stride(2),
@@ -149,7 +158,7 @@ class MyTritonFlashAttentionAutogradFunctionClass(torch.autograd.Function):
             Q_TILE_SIZE=ctx.Q_TILE_SIZE, 
             K_TILE_SIZE=ctx.K_TILE_SIZE,
         )  
-        ctx.save_for_backward(Q, K, V, O, L)
+        return O
         
     @staticmethod
     def backward(ctx, grad_out):
@@ -164,9 +173,11 @@ def flashattn_spec(Q, K, V):
     return O
 
 if __name__ == "__main__":
-    Q = torch.randn((4, 256, 256), device='mps', dtype=torch.float16)
-    K = torch.randn((4, 256, 256), device='mps', dtype=torch.float16)
-    V = torch.randn((4, 256, 256), device='mps', dtype=torch.float16)
+    device = 'cuda' if torch.cuda.is_available() else \
+            'mps' if torch.backends.mps.is_available() else 'cpu'
+    Q = torch.randn((4, 256, 256), device=device, dtype=torch.float16)
+    K = torch.randn((4, 256, 256), device=device, dtype=torch.float16)
+    V = torch.randn((4, 256, 256), device=device, dtype=torch.float16)
     O_spec = flashattn_spec(Q, K, V)
     O = MyFlashAttnAutogradFunctionClass.apply(Q, K, V)
     print(f"Max absolute error: {(O - O_spec).abs().max()}")
