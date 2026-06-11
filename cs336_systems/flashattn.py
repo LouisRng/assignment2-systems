@@ -107,13 +107,15 @@ def flash_fwd_kernel(
     l = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
     m = tl.full((Q_TILE_SIZE,), -float('inf'), dtype=tl.float32)
     O = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    q_offs = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)   # (Q_TILE_SIZE,)
     for i in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
         K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
         S = tl.dot(Q, K) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
         if is_causal:
-            mask = Q[:, None] + Q_TILE_SIZE * query_tile_index >= V[None, :] + K_TILE_SIZE * i
-            S = tl.where(mask, S, -float('inf'))
+            k_offs = i * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)              # (K_TILE_SIZE,)
+            causal_mask = q_offs[:, None] >= k_offs[None, :]                  # (Q, K) tile
+            S = tl.where(causal_mask, S, -float('inf'))
         m_blk = tl.maximum(m, tl.max(S, axis=-1)) # (Q_TILE_SIZE,)
         P = tl.exp(S - m_blk[:, None]) # (Q_TILE_SIZE, K_TILE_SIZE)
         l = tl.exp(m - m_blk) * l + tl.sum(P, axis=-1) # (Q_TILE_SIZE,)
