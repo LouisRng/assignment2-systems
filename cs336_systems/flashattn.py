@@ -111,16 +111,12 @@ def flash_fwd_kernel(
         K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
         S = tl.dot(Q, K) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
+        if is_causal:
+            mask = Q[:, None] + Q_TILE_SIZE * query_tile_index >= V[None, :] + K_TILE_SIZE * i
+            S = tl.where(mask, S, -float('inf'))
         m_blk = tl.maximum(m, tl.max(S, axis=-1)) # (Q_TILE_SIZE,)
         P = tl.exp(S - m_blk[:, None]) # (Q_TILE_SIZE, K_TILE_SIZE)
         l = tl.exp(m - m_blk) * l + tl.sum(P, axis=-1) # (Q_TILE_SIZE,)
-        tl.static_print("Q_TILE_SIZE: ", Q_TILE_SIZE)
-        tl.static_print("K_TILE_SIZE: ", K_TILE_SIZE)
-        tl.static_print("P.shape: ", P.shape)
-        tl.static_print("V.shape: ", V.shape)
-        tl.static_print("m.shape: ", m.shape)
-        tl.static_print("m_blk.shape: ", m_blk.shape)
-        tl.static_print("O.shape: ", O.shape)
         O = tl.exp(m - m_blk)[:, None] * O + tl.dot(P, V) # (Q_TILE_SIZE, D)
         m = m_blk
 
