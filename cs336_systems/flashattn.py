@@ -51,6 +51,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,
 ):
     # program id
     query_tile_index = tl.program_id(0)
@@ -123,7 +124,7 @@ def flash_fwd_kernel(
         O = tl.exp(m - m_blk)[:, None] * O + tl.dot(P, V) # (Q_TILE_SIZE, D)
         m = m_blk
 
-        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        K_block_ptr = K_block_ptr.advance((0, K_TILE_SIZE))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     O = 1.0 / l[:, None] * O
     L = m + tl.log(l) # (Q_TILE_SIZE,)
@@ -158,6 +159,7 @@ class MyTritonFlashAttentionAutogradFunctionClass(torch.autograd.Function):
             D,
             Q_TILE_SIZE=ctx.Q_TILE_SIZE, 
             K_TILE_SIZE=ctx.K_TILE_SIZE,
+            is_causal=is_causal,
         )  
         return O
         
