@@ -106,7 +106,7 @@ def flash_fwd_kernel(
     l = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
     m = tl.full((Q_TILE_SIZE,), -float('inf'), dtype=tl.float32)
     O = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
-    for i in range(tl.cdiv(N_QUERIES, K_TILE_SIZE)):
+    for i in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
         K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
         S = tl.dot(Q, K) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
@@ -125,6 +125,7 @@ def flash_fwd_kernel(
 
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+    O = 1.0 / l[:, None] * O
     L = m + tl.log(l) # (Q_TILE_SIZE,)
     tl.store(O_block_ptr, O, boundary_check=(0, 1))
     tl.store(L_block_ptr, L, boundary_check=(0,))
