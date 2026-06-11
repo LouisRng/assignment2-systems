@@ -73,7 +73,7 @@ def main():
         rope_theta=args.rope_theta,
         use_checkpoint=True
     ).to(device)
-    model = torch.compile(model)
+    model = torch.compile(model) if args.use_torch_compile else model
     
     optimizer = AdamW(
         params=model.parameters(), 
@@ -181,6 +181,6 @@ def main():
     print(f"Total size of saved tensors in Model: {stats["total_size_bytes"] / (1024**2):.2f} MiB")
 
 if __name__ == "__main__":
-    # main()
-    attention_benchmark()
+    main()
+    # attention_benchmark()
 

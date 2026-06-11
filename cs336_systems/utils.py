@@ -68,6 +68,7 @@ def parse_args():
     parser.add_argument("--bench_steps", type=int, default=5) 
     
     parser.add_argument("--use_amp", action="store_true") 
+    parser.add_argument("--use_torch_compile", action="store_true")
     
     return parser.parse_args()
 

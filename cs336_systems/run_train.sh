@@ -39,6 +39,7 @@ python train.py \
    --warmup 5\
    --bench_step 10\
    --use_amp \
+   # --use_torch_compile \
 
 
 # python train.py \
