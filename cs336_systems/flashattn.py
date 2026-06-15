@@ -3,40 +3,6 @@ import triton
 import triton.language as tl
 from einops import einsum
 
-class MyFlashAttnAutogradFunctionClass(torch.autograd.Function):
-    def __init__(self):
-        super().__init__() 
-
-    @staticmethod
-    def forward(ctx, Q, K, V, is_causal=False):
-        B0, B1 = 16, 16
-        b, s, d = Q.shape
-        L = torch.empty((b, s,), device=Q.device, dtype=Q.dtype)
-        O = torch.empty((b, s, d), device=Q.device, dtype=Q.dtype)
-        for i in range(0, s, B0):
-            Q_i = Q[:, i:i+B0, :]
-            O_i= torch.zeros((b, B0, d), device=Q.device, dtype=Q.dtype)
-            l = torch.zeros((b, B0,), device=Q.device, dtype=Q.dtype)
-            m = torch.full((b, B0,), float('-inf'), device=Q.device, dtype=Q.dtype)
-            for j in range(0, s, B1):
-                K_j, V_j = K[:, j:j+B1, :], V[:, j:j+B1, :] # (b, B1, d)
-                S = einsum(Q_i, K_j, "b B_0 d_k, b B_1 d_k -> b B_0 B_1") * (d ** -0.5) # (b, B0, B1)
-                m_blk = torch.maximum(m, torch.max(S, dim=-1).values) # (b, B0,)
-                P = torch.exp(S - m_blk.unsqueeze(-1)) # (b, B0, B1)
-                l = torch.exp(m - m_blk) * l + P.sum(dim=-1) # (b, B0,)
-                O_i = torch.diag_embed(torch.exp(m - m_blk)) @ O_i + P @ V_j # (b, B0, d)
-                m = m_blk
-            O_i = torch.diag_embed(l ** -1.0) @ O_i # (b, B0, d)
-            L_i = m + torch.log(l) # (b, B0,)
-            O[:, i:i+B0, :] = O_i
-            L[:, i:i+B0] = L_i
-        ctx.save_for_backward(L, Q, K, V, O)
-        return O
-                
-    @staticmethod
-    def backward(ctx, grad_out):
-        raise NotImplementedError
-
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr, K_ptr, V_ptr, 
@@ -67,7 +33,7 @@ def flash_fwd_kernel(
         block_shape=(Q_TILE_SIZE, D),
         order=(1, 0),
     )
-    
+
     K_block_ptr = tl.make_block_ptr(
         K_ptr + batch_index * stride_kb,
         shape=(D, N_KEYS),
@@ -85,7 +51,7 @@ def flash_fwd_kernel(
         block_shape=(K_TILE_SIZE, D),
         order=(1, 0),
     )
-    
+
     O_block_ptr = tl.make_block_ptr(
         O_ptr + batch_index * stride_ob,
         shape=(N_QUERIES, D),
@@ -94,7 +60,7 @@ def flash_fwd_kernel(
         block_shape=(Q_TILE_SIZE, D),
         order=(1, 0), 
     )
-    
+
     L_block_ptr = tl.make_block_ptr(
         L_ptr + batch_index * stride_lb,
         shape=(N_QUERIES,),
@@ -115,22 +81,39 @@ def flash_fwd_kernel(
         if is_causal:
             k_offs = i * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)              # (K_TILE_SIZE,)
             causal_mask = q_offs[:, None] >= k_offs[None, :]                  # (Q, K) tile
-            S = tl.where(causal_mask, S, -float('inf'))
-        m_blk = tl.maximum(m, tl.max(S, axis=-1)) # (Q_TILE_SIZE,)
+            S = tl.where(causal_mask, S, -1e6)
+        m_blk = tl.maximum(m, tl.max(S, axis=-1)) # (Q_TILE_SIZE,)  
         P = tl.exp(S - m_blk[:, None]) # (Q_TILE_SIZE, K_TILE_SIZE)
         l = tl.exp(m - m_blk) * l + tl.sum(P, axis=-1) # (Q_TILE_SIZE,)
-        O = tl.exp(m - m_blk)[:, None] * O + tl.dot(P, V) # (Q_TILE_SIZE, D)
+        O = tl.exp(m - m_blk)[:, None] * O
+        P_cast = P.to(V.dtype)
+        O = tl.dot(P_cast, V, acc=O) # (Q_TILE_SIZE, D)
         m = m_blk
 
         K_block_ptr = K_block_ptr.advance((0, K_TILE_SIZE))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     O = 1.0 / l[:, None] * O
     L = m + tl.log(l) # (Q_TILE_SIZE,)
+    O = O.to(O_block_ptr.type.element_ty)
     tl.store(O_block_ptr, O, boundary_check=(0, 1))
     tl.store(L_block_ptr, L, boundary_check=(0,))
-        
-        
-    
+
+
+@torch.compile
+def flashattn_backward(L, Q, K, V, O, scale, grad_out, is_causal=False):
+    D = torch.sum(O * grad_out, dim=-1) # (b, s)
+    S = Q.float() @ K.float().transpose(-2, -1) * scale
+    if is_causal:
+        mask = torch.tril(torch.ones_like(S, dtype=bool))
+        S = torch.where(mask, S, torch.fill(torch.empty_like(S), -1e6))
+    P = torch.exp(S - L[:, :, None]) # (b, s, d) - (b, s)
+    dV = P.transpose(-2, -1) @ grad_out
+    dP = grad_out @ V.transpose(-2, -1)
+    dS = P * (dP - D[:, :, None])
+    dQ = dS @ K * scale
+    dK = dS.transpose(-2, -1) @ Q * scale
+    return dQ, dK, dV, None
+
 class MyTritonFlashAttentionAutogradFunctionClass(torch.autograd.Function):
     def __init__(self):
         super().__init__()
@@ -140,6 +123,7 @@ class MyTritonFlashAttentionAutogradFunctionClass(torch.autograd.Function):
         b, N_QUERIES, D = Q.shape
         _, N_KEYS, _ = K.shape
         scale = D ** -0.5
+        ctx.is_causal = is_causal
         ctx.Q_TILE_SIZE = triton.next_power_of_2(N_QUERIES) // 4
         ctx.K_TILE_SIZE = triton.next_power_of_2(N_KEYS) // 4
         O = torch.zeros((b, N_QUERIES, D), device=Q.device, dtype=Q.dtype)
@@ -160,26 +144,92 @@ class MyTritonFlashAttentionAutogradFunctionClass(torch.autograd.Function):
             is_causal=is_causal,
         )  
         return O
-        
+
     @staticmethod
     def backward(ctx, grad_out):
-        raise NotImplementedError
-        
-def flashattn_spec(Q, K, V):
-    d = Q.shape[-1]
-    S = Q @ K.transpose(-2, -1) * (d ** -0.5) # (b, s, s) 
-    P = torch.softmax(S, dim=-1) # (b, s, s)
-    O = P @ V # (b, s, d)
-    L = torch.logsumexp(S, dim=-1) # (b, s)
-    return O
+        L, Q, K, V, O = ctx.saved_tensors
+        scale = Q.shape[-1] ** -0.5
+        return flashattn_backward(L, Q, K, V, O, scale, grad_out, ctx.is_causal)
 
-if __name__ == "__main__":
+
+class MyFlashAttnAutogradFunctionClass(torch.autograd.Function):
+    def __init__(self):
+        super().__init__() 
+
+    @staticmethod
+    def forward(ctx, Q, K, V, is_causal=False):
+        B0, B1 = 16, 16
+        b, N_q, d_k = Q.shape
+        _, N_k, d_v = V.shape
+        scale = d_k ** -0.5
+        L = torch.empty((b, N_q,), device=Q.device, dtype=Q.dtype)
+        O = torch.empty((b, N_q, d_k), device=Q.device, dtype=Q.dtype)
+        for i in range(0, N_q, B0):
+            Q_i = Q[:, i:i+B0, :]
+            O_i = torch.zeros((b, B0, d_k), device=Q.device, dtype=Q.dtype)
+            l = torch.zeros((b, B0,), device=Q.device, dtype=Q.dtype)
+            m = torch.full((b, B0,), float('-inf'), device=Q.device, dtype=Q.dtype)
+            for j in range(0, N_k, B1):
+                K_j, V_j = K[:, j:j+B1, :], V[:, j:j+B1, :] # (b, B1, d)
+                S = einsum(Q_i, K_j, "b B_0 d_k, b B_1 d_k -> b B_0 B_1") * scale # (b, B0, B1)
+                if is_causal:
+                    q_offs = torch.arange(i, min(i+B0, N_q), device=Q.device)[None, :] # (1, B0)
+                    k_offs = torch.arange(j, min(j+B1, N_k), device=Q.device)[:, None] # (B1, 1)
+                    causal_mask = q_offs >= k_offs # (B0, B1)
+                    S = torch.where(causal_mask[None, :, :], S, torch.tensor(-float("inf"), device=Q.device, dtype=Q.dtype))
+                m_blk = torch.maximum(m, torch.max(S, dim=-1).values) # (b, B0,)
+                P = torch.exp(S - m_blk.unsqueeze(-1)) # (b, B0, B1)
+                l = torch.exp(m - m_blk) * l + P.sum(dim=-1) # (b, B0,)
+                O_i = torch.diag_embed(torch.exp(m - m_blk)) @ O_i + P @ V_j # (b, B0, d)
+                m = m_blk
+            O_i = torch.diag_embed(l ** -1.0) @ O_i # (b, B0, d)
+            L_i = m + torch.log(l) # (b, B0,)
+            O[:, i:i+B0, :] = O_i
+            L[:, i:i+B0] = L_i
+        ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_causal = is_causal
+        return O
+                
+    @staticmethod
+    def backward(ctx, grad_out):
+        L, Q, K, V, O = ctx.saved_tensors
+        scale = Q.shape[-1] ** -0.5
+        return flashattn_backward(L, Q, K, V, O, scale, grad_out, ctx.is_causal)
+
+def benchmark_pytorch_flash_attn():
     device = 'cuda' if torch.cuda.is_available() else \
             'mps' if torch.backends.mps.is_available() else 'cpu'
-    Q = torch.randn((4, 256, 256), device=device, dtype=torch.float16)
-    K = torch.randn((4, 256, 256), device=device, dtype=torch.float16)
-    V = torch.randn((4, 256, 256), device=device, dtype=torch.float16)
-    O_spec = flashattn_spec(Q, K, V)
-    O = MyFlashAttnAutogradFunctionClass.apply(Q, K, V)
-    print(f"Max absolute error: {(O - O_spec).abs().max()}")
+    for i in range(7, 17):
+        for j in range(4, 8):
+            print(f"Benchmarking Pytorch Flash Attention with Q/K/V shape: (1, {2 ** i}, {2 ** j})")
+            Q = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
+            K = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
+            V = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
+            out = MyTritonFlashAttentionAutogradFunctionClass.apply(Q, K, V, True)
+            out.sum().backward()
+            
+def benchmark_triton_flash_attn():
+    device = 'cuda' if torch.cuda.is_available() else \
+            'mps' if torch.backends.mps.is_available() else 'cpu'
+    for i in range(7, 17):
+        for j in range(4, 8):
+            print(f"Benchmarking Triton Flash Attention with Q/K/V shape: (1, {2 ** i}, {2 ** j})")
+            Q = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
+            K = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
+            V = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
+            out = MyFlashAttnAutogradFunctionClass.apply(Q, K, V, True)
+            out.sum().backward()
+
+if __name__ == "__main__":
+    print("Benchmarking Pytorch Flash Attention Implementation")
+    triton.testing.do_bench(benchmark_pytorch_flash_attn(), warmup=5, rep=25)
+
+    print("-" * 50)
+
+    print("Benchmarking Triton Flash Attention Implementation")
+    triton.testing.do_bench(benchmark_triton_flash_attn(), warmup=5, rep=25)
+
+    
+    
+    
     

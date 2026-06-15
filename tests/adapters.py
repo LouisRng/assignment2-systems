@@ -1,5 +1,5 @@
 from __future__ import annotations
-from cs336_systems.flashattn import MyFlashAttnAutogradFunctionClass, MyTritonFlashAttentionAutogradFunctionClass
+from cs336_systems.flashattn import MyFlashAttnAutogradFunctionClass #, MyTritonFlashAttentionAutogradFunctionClass
 
 import torch
 
