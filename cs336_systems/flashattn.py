@@ -176,14 +176,14 @@ class MyFlashAttnAutogradFunctionClass(torch.autograd.Function):
             O_i = torch.zeros((b, B0, d_k), device=Q.device, dtype=Q.dtype)
             l = torch.zeros((b, B0,), device=Q.device, dtype=Q.dtype)
             m = torch.full((b, B0,), float('-inf'), device=Q.device, dtype=Q.dtype)
+            q_offs = i * B0 + torch.arange(0, B0, device=Q.device)[:, None] # (B0, 1) 
             for j in range(0, N_k, B1):
                 K_j, V_j = K[:, j:j+B1, :], V[:, j:j+B1, :] # (b, B1, d)
                 S = einsum(Q_i, K_j, "b B_0 d_k, b B_1 d_k -> b B_0 B_1") * scale # (b, B0, B1)
                 if is_causal:
-                    q_offs = torch.arange(i, min(i+B0, N_q), device=Q.device)[None, :] # (1, B0)
-                    k_offs = torch.arange(j, min(j+B1, N_k), device=Q.device)[:, None] # (B1, 1)
+                    k_offs = j * B1 + torch.arange(0, B1, device=Q.device)[None, :] # (1, B1)
                     causal_mask = q_offs >= k_offs # (B0, B1)
-                    S = torch.where(causal_mask[None, :, :], S, torch.tensor(-float("inf"), device=Q.device, dtype=Q.dtype))
+                    S = torch.where(causal_mask, S, -float('inf'))
                 m_blk = torch.maximum(m, torch.max(S, dim=-1).values) # (b, B0,)
                 P = torch.exp(S - m_blk.unsqueeze(-1)) # (b, B0, B1)
                 l = torch.exp(m - m_blk) * l + P.sum(dim=-1) # (b, B0,)
