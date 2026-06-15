@@ -104,6 +104,7 @@ def flash_fwd_kernel(
 
 @torch.compile
 def flashattn_backward(L, Q, K, V, O, scale, grad_out, is_causal=False):
+    print(f"Running backward with grad_out dtype: {grad_out.dtype}, Q dtype: {Q.dtype}, K dtype: {K.dtype}, V dtype: {V.dtype}, O dtype: {O.dtype}")
     grad_out = grad_out.float()
     D = torch.sum(O * grad_out, dim=-1) # (b, s)
     S = Q.float() @ K.float().transpose(-2, -1) * scale
