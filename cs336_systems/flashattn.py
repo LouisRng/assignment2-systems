@@ -204,38 +204,58 @@ class MyFlashAttnAutogradFunctionClass(torch.autograd.Function):
         return flashattn_backward(L, Q, K, V, O, scale, grad_out, ctx.is_causal)
 
 def benchmark_pytorch_flash_attn():
+    print("Benchmarking Pytorch Flash Attention Implementation")
     device = 'cuda' if torch.cuda.is_available() else \
             'mps' if torch.backends.mps.is_available() else 'cpu'
-    for i in range(7, 17):
-        for j in range(4, 8):
-            print(f"Benchmarking Pytorch Flash Attention with Q/K/V shape: (1, {2 ** i}, {2 ** j})")
-            Q = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
-            K = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
-            V = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
+    for seq_len in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]:
+        for d in [16, 32, 64, 128]:
+            print(f"Sequence Length: {seq_len}, Dimension: {d}")
+            Q = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
+            K = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
+            V = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
+            
+            cls = MyFlashAttnAutogradFunctionClass
+            
+            fwd_ms = triton.testing.do_bench(lambda: cls.apply(Q, K, V, True), warmup=25, rep=100)
+            
             # out 的精度和输入是一致的
-            out = MyFlashAttnAutogradFunctionClass.apply(Q, K, V, True)
-            out.sum().backward()
+            # 测 forward + backward:用 grad_to_none 在每次迭代前清梯度
+            def fwd_bwd():
+                out = cls.apply(Q, K, V, True)
+                out.sum().backward()
+            fwd_bwd_ms = triton.testing.do_bench(fwd_bwd, warmup=25, rep=100, grad_to_none=[Q, K, V])
+            print(f"  fwd: {fwd_ms:.3f} ms | fwd+bwd: {fwd_bwd_ms:.3f} ms")
             
 def benchmark_triton_flash_attn():
+    print("Benchmarking Triton Flash Attention Implementation")
     device = 'cuda' if torch.cuda.is_available() else \
             'mps' if torch.backends.mps.is_available() else 'cpu'
-    for i in range(7, 17):
-        for j in range(4, 8):
-            print(f"Benchmarking Triton Flash Attention with Q/K/V shape: (1, {2 ** i}, {2 ** j})")
-            Q = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
-            K = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
-            V = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
-            out = MyTritonFlashAttentionAutogradFunctionClass.apply(Q, K, V, True)
-            out.sum().backward()
+    for seq_len in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]:
+        for d in [16, 32, 64, 128]:
+            print(f"Sequence Length: {seq_len}, Dimension: {d}")
+            Q = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
+            K = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
+            V = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
+            
+            cls = MyTritonFlashAttentionAutogradFunctionClass
+            
+            fwd_ms = triton.testing.do_bench(lambda: cls.apply(Q, K, V, True), warmup=25, rep=100)
+            
+            # out 的精度和输入是一致的
+            # 测 forward + backward:用 grad_to_none 在每次迭代前清梯度
+            def fwd_bwd():
+                out = cls.apply(Q, K, V, True)
+                out.sum().backward()
+            fwd_bwd_ms = triton.testing.do_bench(fwd_bwd, warmup=25, rep=100, grad_to_none=[Q, K, V])
+            print(f"  fwd: {fwd_ms:.3f} ms | fwd+bwd: {fwd_bwd_ms:.3f} ms")
 
 if __name__ == "__main__":
-    print("Benchmarking Pytorch Flash Attention Implementation")
-    triton.testing.do_bench(benchmark_pytorch_flash_attn(), warmup=5, rep=25)
+    
+    benchmark_pytorch_flash_attn()
 
     print("-" * 50)
 
-    print("Benchmarking Triton Flash Attention Implementation")
-    triton.testing.do_bench(benchmark_triton_flash_attn(), warmup=5, rep=25)
+    benchmark_triton_flash_attn()
 
     
     
