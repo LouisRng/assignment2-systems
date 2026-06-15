@@ -104,18 +104,22 @@ def flash_fwd_kernel(
 
 @torch.compile
 def flashattn_backward(L, Q, K, V, O, scale, grad_out, is_causal=False):
-    D = torch.sum(O * grad_out, dim=-1) # (b, s)
-    S = Q @ K.transpose(-2, -1) * scale
+    orig_dtype = Q.dtype
+    Q, K, V, O, grad_out = (x.float() for x in (Q, K, V, O, grad_out))  # 全升 fp32
+    L = L.float()                                    # 本来就是 fp32
+
+    Dvec = torch.sum(O * grad_out, dim=-1)
+    S = Q @ K.transpose(-2, -1) * scale              # fp32,和 forward 对齐
     if is_causal:
         mask = torch.tril(torch.ones_like(S, dtype=bool))
-        S = torch.where(mask, S, torch.fill(torch.empty_like(S), float('-inf')))
-    P = torch.exp(S - L[:, :, None]) # (b, s, d) - (b, s)
+        S = S.masked_fill(~mask, float('-inf'))      # 顺手换掉 torch.fill(empty) 的脆弱写法
+    P = torch.exp(S - L[:, :, None])
     dV = P.transpose(-2, -1) @ grad_out
     dP = grad_out @ V.transpose(-2, -1)
-    dS = P * (dP - D[:, :, None])
+    dS = P * (dP - Dvec[:, :, None])
     dQ = dS @ K * scale
     dK = dS.transpose(-2, -1) @ Q * scale
-    return dQ, dK, dV, None
+    return dQ.to(orig_dtype), dK.to(orig_dtype), dV.to(orig_dtype), None   # 降回 bf16
 
 class MyTritonFlashAttentionAutogradFunctionClass(torch.autograd.Function):
     def __init__(self):
@@ -127,13 +131,12 @@ class MyTritonFlashAttentionAutogradFunctionClass(torch.autograd.Function):
         _, N_KEYS, _ = K.shape
         scale = D ** -0.5
         ctx.is_causal = is_causal
-        ctx.Q_TILE_SIZE = 16 if N_QUERIES < 128 else triton.next_power_of_2(N_QUERIES) // 64
-        ctx.K_TILE_SIZE = 16
+        ctx.Q_TILE_SIZE = 64
+        ctx.K_TILE_SIZE = 64
         O = torch.zeros((b, N_QUERIES, D), device=Q.device, dtype=Q.dtype)
         
         # L 用于存储每个查询的 logsumexp 的结果，精度保持为float32，避免数值不稳定
         L = torch.empty((b, N_QUERIES), device=Q.device, dtype=torch.float32)
-        ctx.save_for_backward(L, Q, K, V, O)
         flash_fwd_kernel[triton.cdiv(N_QUERIES, ctx.Q_TILE_SIZE), b](
             Q, K, V, O, L,
             Q.stride(0), Q.stride(1), Q.stride(2),
@@ -148,6 +151,7 @@ class MyTritonFlashAttentionAutogradFunctionClass(torch.autograd.Function):
             K_TILE_SIZE=ctx.K_TILE_SIZE,
             is_causal=is_causal,
         )  
+        ctx.save_for_backward(L, Q, K, V, O)
         return O
 
     @staticmethod
@@ -186,7 +190,7 @@ class MyFlashAttnAutogradFunctionClass(torch.autograd.Function):
                 m_blk = torch.maximum(m, torch.max(S, dim=-1).values) # (b, B0,)
                 P = torch.exp(S - m_blk.unsqueeze(-1)) # (b, B0, B1)
                 l = torch.exp(m - m_blk) * l + P.sum(dim=-1) # (b, B0,)
-                O_i = torch.exp(m - m_blk)[..., None] * O_i + P @ V_j # (b, B0, d)
+                O_i = torch.exp(m - m_blk)[..., None] * O_i + P @ V_j.float() # (b, B0, d)
                 m = m_blk
             O_i = O_i / l[..., None] # (b, B0, d)
             L_i = m + torch.log(l) # (b, B0,)
