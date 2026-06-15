@@ -192,7 +192,6 @@ class MyFlashAttnAutogradFunctionClass(torch.autograd.Function):
             L_i = m + torch.log(l) # (b, B0,)
             O[:, i:i+B0, :] = O_i.to(Q.dtype)        # 输出降回 bf16
             L[:, i:i+B0] = L_i
-        L = torch.empty((b, N_q,), device=Q.device, dtype=torch.float32)   # L 存 fp32!
         ctx.save_for_backward(L, Q, K, V, O)
         ctx.is_causal = is_causal
         return O
