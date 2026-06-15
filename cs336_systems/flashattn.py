@@ -128,8 +128,8 @@ class MyTritonFlashAttentionAutogradFunctionClass(torch.autograd.Function):
         _, N_KEYS, _ = K.shape
         scale = D ** -0.5
         ctx.is_causal = is_causal
-        ctx.Q_TILE_SIZE = triton.next_power_of_2(N_QUERIES) // 4
-        ctx.K_TILE_SIZE = triton.next_power_of_2(N_KEYS) // 4
+        ctx.Q_TILE_SIZE = 16 if N_QUERIES < 128 else triton.next_power_of_2(N_QUERIES) // 64
+        ctx.K_TILE_SIZE = 16
         O = torch.zeros((b, N_QUERIES, D), device=Q.device, dtype=Q.dtype)
         
         # L 用于存储每个查询的 logsumexp 的结果，精度保持为float32，避免数值不稳定
@@ -164,9 +164,10 @@ class MyFlashAttnAutogradFunctionClass(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
-        B0, B1 = 16, 16
         b, N_q, d_k = Q.shape
         _, N_k, d_v = V.shape
+        B0 = 16 if N_q < 128 else triton.next_power_of_2(N_q) // 64
+        B1 = 16 
         scale = d_k ** -0.5
         L = torch.empty((b, N_q,), device=Q.device, dtype=Q.dtype)
         O = torch.empty((b, N_q, d_k), device=Q.device, dtype=Q.dtype)
@@ -212,7 +213,7 @@ def benchmark_pytorch_flash_attn():
             K = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
             V = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
             # out 的精度和输入是一致的
-            out = MyTritonFlashAttentionAutogradFunctionClass.apply(Q, K, V, True)
+            out = MyFlashAttnAutogradFunctionClass.apply(Q, K, V, True)
             out.sum().backward()
             
 def benchmark_triton_flash_attn():
@@ -224,7 +225,7 @@ def benchmark_triton_flash_attn():
             Q = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
             K = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
             V = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
-            out = MyFlashAttnAutogradFunctionClass.apply(Q, K, V, True)
+            out = MyTritonFlashAttentionAutogradFunctionClass.apply(Q, K, V, True)
             out.sum().backward()
 
 if __name__ == "__main__":
