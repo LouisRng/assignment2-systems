@@ -104,6 +104,7 @@ def flash_fwd_kernel(
 
 @torch.compile
 def flashattn_backward(L, Q, K, V, O, scale, grad_out, is_causal=False):
+    grad_out = grad_out.float()
     D = torch.sum(O * grad_out, dim=-1) # (b, s)
     S = Q.float() @ K.float().transpose(-2, -1) * scale
     if is_causal:
@@ -210,6 +211,7 @@ def benchmark_pytorch_flash_attn():
             Q = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
             K = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
             V = torch.randn((1, 2 ** i, 2 ** j), device=device, dtype=torch.bfloat16, requires_grad=True)
+            # out 的精度和输入是一致的
             out = MyTritonFlashAttentionAutogradFunctionClass.apply(Q, K, V, True)
             out.sum().backward()
             
