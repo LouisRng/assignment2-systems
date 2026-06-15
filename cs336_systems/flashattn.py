@@ -104,12 +104,11 @@ def flash_fwd_kernel(
 
 @torch.compile
 def flashattn_backward(L, Q, K, V, O, scale, grad_out, is_causal=False):
-    L = L.to(torch.bfloat16) 
     D = torch.sum(O * grad_out, dim=-1) # (b, s)
     S = Q @ K.transpose(-2, -1) * scale
     if is_causal:
         mask = torch.tril(torch.ones_like(S, dtype=bool))
-        S = torch.where(mask, S, torch.fill(torch.empty_like(S), -1e6))
+        S = torch.where(mask, S, torch.fill(torch.empty_like(S), float('-inf')))
     P = torch.exp(S - L[:, :, None]) # (b, s, d) - (b, s)
     dV = P.transpose(-2, -1) @ grad_out
     dP = grad_out @ V.transpose(-2, -1)
@@ -173,26 +172,27 @@ class MyFlashAttnAutogradFunctionClass(torch.autograd.Function):
         O = torch.empty((b, N_q, d_k), device=Q.device, dtype=Q.dtype)
         for i in range(0, N_q, B0):
             Q_i = Q[:, i:i+B0, :]
-            O_i = torch.zeros((b, B0, d_k), device=Q.device, dtype=Q.dtype)
-            l = torch.zeros((b, B0,), device=Q.device, dtype=Q.dtype)
-            m = torch.full((b, B0,), float('-inf'), device=Q.device, dtype=Q.dtype)
-            q_offs = i * B0 + torch.arange(0, B0, device=Q.device)[:, None] # (B0, 1) 
+            O_i = torch.zeros((b, B0, d_k), device=Q.device, dtype=torch.float32)
+            l = torch.zeros((b, B0,), device=Q.device, dtype=torch.float32)
+            m = torch.full((b, B0,), float('-inf'), device=Q.device, dtype=torch.float32)
+            q_offs = i + torch.arange(0, B0, device=Q.device)[:, None] # (B0, 1) 
             for j in range(0, N_k, B1):
                 K_j, V_j = K[:, j:j+B1, :], V[:, j:j+B1, :] # (b, B1, d)
                 S = einsum(Q_i, K_j, "b B_0 d_k, b B_1 d_k -> b B_0 B_1") * scale # (b, B0, B1)
                 if is_causal:
-                    k_offs = j * B1 + torch.arange(0, B1, device=Q.device)[None, :] # (1, B1)
+                    k_offs = j + torch.arange(0, B1, device=Q.device)[None, :] # (1, B1)
                     causal_mask = q_offs >= k_offs # (B0, B1)
                     S = torch.where(causal_mask, S, -float('inf'))
                 m_blk = torch.maximum(m, torch.max(S, dim=-1).values) # (b, B0,)
                 P = torch.exp(S - m_blk.unsqueeze(-1)) # (b, B0, B1)
                 l = torch.exp(m - m_blk) * l + P.sum(dim=-1) # (b, B0,)
-                O_i = torch.diag_embed(torch.exp(m - m_blk)) @ O_i + P @ V_j # (b, B0, d)
+                O_i = torch.exp(m - m_blk)[..., None] * O_i + P @ V_j # (b, B0, d)
                 m = m_blk
-            O_i = torch.diag_embed(l ** -1.0) @ O_i # (b, B0, d)
+            O_i = O_i / l[..., None] # (b, B0, d)
             L_i = m + torch.log(l) # (b, B0,)
-            O[:, i:i+B0, :] = O_i
+            O[:, i:i+B0, :] = O_i.to(Q.dtype)        # 输出降回 bf16
             L[:, i:i+B0] = L_i
+        L = torch.empty((b, N_q,), device=Q.device, dtype=torch.float32)   # L 存 fp32!
         ctx.save_for_backward(L, Q, K, V, O)
         ctx.is_causal = is_causal
         return O
@@ -207,7 +207,7 @@ def benchmark_pytorch_flash_attn():
     print("Benchmarking Pytorch Flash Attention Implementation")
     device = 'cuda' if torch.cuda.is_available() else \
             'mps' if torch.backends.mps.is_available() else 'cpu'
-    for seq_len in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]:
+    for seq_len in [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]:
         for d in [16, 32, 64, 128]:
             print(f"Sequence Length: {seq_len}, Dimension: {d}")
             Q = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -230,7 +230,7 @@ def benchmark_triton_flash_attn():
     print("Benchmarking Triton Flash Attention Implementation")
     device = 'cuda' if torch.cuda.is_available() else \
             'mps' if torch.backends.mps.is_available() else 'cpu'
-    for seq_len in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]:
+    for seq_len in [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]:
         for d in [16, 32, 64, 128]:
             print(f"Sequence Length: {seq_len}, Dimension: {d}")
             Q = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
