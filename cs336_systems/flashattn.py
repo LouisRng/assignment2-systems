@@ -99,7 +99,6 @@ def flash_fwd_kernel(
 
     # O 的精度和输入保持一致，L 的精度保持为float32，避免数值不稳定
     tl.store(O_block_ptr, O.to(O_block_ptr.type.element_ty), boundary_check=(0, 1))
-    tl.store(O_block_ptr, O, boundary_check=(0, 1))
     tl.store(L_block_ptr, L, boundary_check=(0,))
 
 
