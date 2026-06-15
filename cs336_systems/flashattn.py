@@ -206,6 +206,37 @@ class MyFlashAttnAutogradFunctionClass(torch.autograd.Function):
         scale = Q.shape[-1] ** -0.5
         return flashattn_backward(L, Q, K, V, O, scale, grad_out, ctx.is_causal)
 
+def naive_attention(Q, K, V, is_causal=False):
+    # Q, K, V: (b, N, d),输入 bf16
+    scale = Q.shape[-1] ** -0.5
+    S = (Q.float() @ K.float().transpose(-2, -1)) * scale      # fp32,(b, N_q, N_k)
+    if is_causal:
+        N_q, N_k = S.shape[-2], S.shape[-1]
+        mask = torch.triu(torch.ones(N_q, N_k, dtype=torch.bool, device=S.device), diagonal=1)
+        S = S.masked_fill(mask, float('-inf'))                 # 上三角(未来)置 -inf
+    P = torch.softmax(S, dim=-1)                               # fp32 softmax
+    O = P @ V.float()                                          # fp32
+    return O.to(Q.dtype)                                       # 降回 bf16
+
+def benchmark_naive_pytorch_flash_attn():
+    print("Benchmarking naive Pytorch Flash Attention Implementation")
+    device = 'cuda' if torch.cuda.is_available() else \
+            'mps' if torch.backends.mps.is_available() else 'cpu'
+    for seq_len in [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]:
+        for d in [16, 32, 64, 128]:
+            print(f"Sequence Length: {seq_len}, Dimension: {d}")
+            Q = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
+            K = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
+            V = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
+            
+            fwd_ms = triton.testing.do_bench(lambda: naive_attention(Q, K, V, True), warmup=25, rep=100)
+
+            def fwd_bwd():
+                out = naive_attention(Q, K, V, True)
+                out.sum().backward()
+            fwd_bwd_ms = triton.testing.do_bench(fwd_bwd, warmup=25, rep=100, grad_to_none=[Q, K, V])
+            print(f"  fwd: {fwd_ms:.3f} ms | fwd+bwd: {fwd_bwd_ms:.3f} ms")
+            
 def benchmark_pytorch_flash_attn():
     print("Benchmarking Pytorch Flash Attention Implementation")
     device = 'cuda' if torch.cuda.is_available() else \
@@ -251,15 +282,63 @@ def benchmark_triton_flash_attn():
                 out.sum().backward()
             fwd_bwd_ms = triton.testing.do_bench(fwd_bwd, warmup=25, rep=100, grad_to_none=[Q, K, V])
             print(f"  fwd: {fwd_ms:.3f} ms | fwd+bwd: {fwd_bwd_ms:.3f} ms")
+            
+class MyNaiveFlashAttnAutogradFunctionClass(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, Q, K, V, is_causal=False):
+        scale = Q.shape[-1] ** -0.5
+        S = (Q.float() @ K.float().transpose(-2, -1)) * scale      # fp32,(b, N_q, N_k),整块算,无 tile
+        if is_causal:
+            N_q, N_k = S.shape[-2], S.shape[-1]
+            mask = torch.triu(torch.ones(N_q, N_k, dtype=torch.bool, device=S.device), diagonal=1)
+            S = S.masked_fill(mask, float('-inf'))
+        L = torch.logsumexp(S, dim=-1)                              # (b, N_q),fp32,给 backward
+        P = torch.softmax(S, dim=-1)                                # fp32
+        O = (P @ V.float()).to(Q.dtype)                             # 降回 bf16
+        ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_causal = is_causal
+        return O
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        L, Q, K, V, O = ctx.saved_tensors
+        scale = Q.shape[-1] ** -0.5
+        return flashattn_backward(L, Q, K, V, O, scale, grad_out, ctx.is_causal)
+
+def benchmark_autograd_naive_flash_attn():
+    print("Benchmarking autograd naive Pytorch Flash Attention Implementation")
+    device = 'cuda' if torch.cuda.is_available() else \
+            'mps' if torch.backends.mps.is_available() else 'cpu'
+    for seq_len in [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]:
+        for d in [16, 32, 64, 128]:
+            print(f"Sequence Length: {seq_len}, Dimension: {d}")
+            Q = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
+            K = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
+            V = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
+            
+            cls = MyNaiveFlashAttnAutogradFunctionClass
+            
+            fwd_ms = triton.testing.do_bench(lambda: cls.apply(Q, K, V, True), warmup=25, rep=100)
+            
+            # out 的精度和输入是一致的
+            # 测 forward + backward:用 grad_to_none 在每次迭代前清梯度
+            def fwd_bwd():
+                out = cls.apply(Q, K, V, True)
+                out.sum().backward()
+            fwd_bwd_ms = triton.testing.do_bench(fwd_bwd, warmup=25, rep=100, grad_to_none=[Q, K, V])
+            print(f"  fwd: {fwd_ms:.3f} ms | fwd+bwd: {fwd_bwd_ms:.3f} ms")
 
 if __name__ == "__main__":
     
-    benchmark_pytorch_flash_attn()
+    # benchmark_pytorch_flash_attn()
 
     print("-" * 50)
 
     benchmark_triton_flash_attn()
 
+    benchmark_naive_pytorch_flash_attn()
+
+    benchmark_autograd_naive_flash_attn() 
     
     
     
