@@ -16,9 +16,9 @@ VOCAB = DATA_PATH / "tinystories_bpe_vocab.json"
 TRAIN_DATA = DATA_PATH / "TinyStoriesV2-GPT4-train_tokens.bin"
 VAL_DATA = DATA_PATH / "TinyStoriesV2-GPT4-valid_tokens.bin"
 
-device = "cpu"
-# device = 'cuda' if torch.cuda.is_available() else \
-#         'mps' if torch.backends.mps.is_available() else 'cpu'
+# device = "cpu"
+device = 'cuda' if torch.cuda.is_available() else \
+        'mps' if torch.backends.mps.is_available() else 'cpu'
 batch_size = 8
 vocab_size = 10_000
 context_length = 16
@@ -91,7 +91,7 @@ def setup(rank, world_size):
     os.environ["MASTER_PORT"] = "29500" 
     # torch.cuda.set_device(rank)
     dist.init_process_group(
-        backend="gloo",
+        backend="nccl",
         rank=rank,
         world_size=world_size,
         # device_id=torch.device(f"cuda:{rank}"),
@@ -167,6 +167,7 @@ def benchmark(rank, world_size, data, warmup):
 if __name__ == "__main__":
     world_size = 4
     data = load_data(TRAIN_DATA)
+    print(f"training model with world_size={world_size}, batch_size={batch_size}, context_length={context_length}, d_model={d_model}, num_layers={num_layers}, num_heads={num_heads}, d_ff={d_ff}, rope_theta={rope_theta} on {device} using {world_size} processes")
     mp.spawn(fn=benchmark, args=(world_size, data, warmup), nprocs=world_size, join=True) 
         
 
