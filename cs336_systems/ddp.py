@@ -22,14 +22,14 @@ device = "cpu"
 batch_size = 8
 vocab_size = 10_000
 context_length = 16
-d_model = 16
-num_layers = 8
-num_heads = 4
-d_ff = 4
+d_model = 2560
+num_layers = 32
+num_heads = 32
+d_ff = 10240
 rope_theta = 10000.0
 betas = [0.9, 0.99]
 weight_decay = 0.01
-steps = 100
+steps = 5
 warmup = 5
 
 def load_data(path: str | os.PathLike) -> npt.NDArray:
@@ -101,23 +101,27 @@ def benchmark(rank, world_size, data, warmup):
     setup(rank, world_size)
     n = batch_size // world_size
     model = TransformerLM(vocab_size, context_length, num_layers, d_model, num_heads, d_ff, rope_theta)
-    ddp_model = DDP(model)
-    ddp_model.to(device)
-    optimizer = AdamW(ddp_model.parameters(), lr=1e-3, betas=betas, eps=1e-8, weight_decay=weight_decay)
+    model.to(device)
+    optimizer = AdamW(model.parameters(), lr=1e-3, betas=betas, eps=1e-8, weight_decay=weight_decay)
     
     # 验证参数是不是同步了
     # gathered = [None] * world_size
     # fingerprint = sum([param.sum() for param in ddp_model.parameters()])
     # dist.all_gather_object(gathered, fingerprint)
     # print(gathered)
+    with torch.no_grad():
+        for param in model.parameters():
+            dist.broadcast(param, 0, async_op=False)
     
     sliced_inputs = torch.empty((n, context_length), dtype=torch.int64)
     sliced_targets = torch.empty((n, context_length), dtype=torch.int64)
     # warmup
+    elapsed_list = []
+    elapsed_commu_grad_list = []
         
     for step in range(steps):
-        if step >= warmup:
-            start = time.perf_counter()
+        if device == "cuda":
+            torch.cuda.synchronize()
         if rank == 0:
             inputs, targets = get_batch(data, batch_size, context_length, device)
             inputs_scatter_list = [inputs[i * n: i * n + n, :] for i in range(world_size)]
@@ -128,20 +132,35 @@ def benchmark(rank, world_size, data, warmup):
         dist.scatter(sliced_inputs, inputs_scatter_list, src=0)
         dist.scatter(sliced_targets, targets_scatter_list, src=0)
         if step >= warmup:
-            start_nccl = time.perf_counter()
-        logits = ddp_model(sliced_inputs)
-        if step >= warmup:
-            elapsed_nccl = time.perf_counter() - start_nccl
+            start = time.perf_counter()
+        logits = model(sliced_inputs)
         loss = cross_entropy(logits, sliced_targets)
         optimizer.zero_grad()
         loss.backward()
-        ddp_model.finish_gradient_synchronization()
-        # torch.cuda.synchronize()
+        if device == "cuda":
+            torch.cuda.synchronize()
+        if step >= warmup:
+            start_commu_grad = time.perf_counter()
+        for param in model.parameters():
+            if param.requires_grad:
+                dist.all_reduce(param.grad, async_op=False)
+                param.grad.div_(world_size) 
+        if device == "cuda":
+            torch.cuda.synchronize()
+        if step >= warmup:
+            elapsed_commu_grad = time.perf_counter() - start_commu_grad
+            elapsed_commu_grad_list.append(elapsed_commu_grad)
         optimizer.step()
+        if device == "cuda":
+            torch.cuda.synchronize()
         if step >= warmup:
             elapsed = time.perf_counter() - start
-            print(f"rank:{rank} step:{step} loss:{loss.item():.4f} time:{elapsed:.4f}s")
-            print(f"the proportion of time spent on NCCL communication: {elapsed_nccl / elapsed * 100:.4f} %")
+            elapsed_list.append(elapsed)
+        
+    elapsed = np.mean(elapsed_list)
+    elapsed_commu_grad = np.mean(elapsed_commu_grad_list)
+    print(f"rank:{rank} training time:{elapsed:.4f}s")
+    print(f"rank:{rank} the proportion of time spent on gradients communication: {elapsed_commu_grad / elapsed * 100:.4f} %")
      
 
     

@@ -222,7 +222,7 @@ def benchmark_naive_pytorch_flash_attn():
     print("Benchmarking naive Pytorch Flash Attention Implementation")
     device = 'cuda' if torch.cuda.is_available() else \
             'mps' if torch.backends.mps.is_available() else 'cpu'
-    for seq_len in [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]:
+    for seq_len in [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]:
         for d in [16, 32, 64, 128]:
             print(f"Sequence Length: {seq_len}, Dimension: {d}")
             Q = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -241,7 +241,7 @@ def benchmark_pytorch_flash_attn():
     print("Benchmarking Pytorch Flash Attention Implementation")
     device = 'cuda' if torch.cuda.is_available() else \
             'mps' if torch.backends.mps.is_available() else 'cpu'
-    for seq_len in [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]:
+    for seq_len in [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]:
         for d in [16, 32, 64, 128]:
             print(f"Sequence Length: {seq_len}, Dimension: {d}")
             Q = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -264,7 +264,7 @@ def benchmark_triton_flash_attn():
     print("Benchmarking Triton Flash Attention Implementation")
     device = 'cuda' if torch.cuda.is_available() else \
             'mps' if torch.backends.mps.is_available() else 'cpu'
-    for seq_len in [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]:
+    for seq_len in [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]:
         for d in [16, 32, 64, 128]:
             print(f"Sequence Length: {seq_len}, Dimension: {d}")
             Q = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -309,7 +309,7 @@ def benchmark_autograd_naive_flash_attn():
     print("Benchmarking autograd naive Pytorch Flash Attention Implementation")
     device = 'cuda' if torch.cuda.is_available() else \
             'mps' if torch.backends.mps.is_available() else 'cpu'
-    for seq_len in [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]:
+    for seq_len in [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]:
         for d in [16, 32, 64, 128]:
             print(f"Sequence Length: {seq_len}, Dimension: {d}")
             Q = torch.randn((1, seq_len, d), device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -334,7 +334,7 @@ if __name__ == "__main__":
 
     print("-" * 50)
 
-    benchmark_triton_flash_attn()
+    # benchmark_triton_flash_attn()
 
     benchmark_naive_pytorch_flash_attn()
 
