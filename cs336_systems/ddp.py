@@ -115,8 +115,8 @@ def benchmark(rank, world_size, data, warmup):
             for param in model.parameters():
                 dist.broadcast(param, 0, async_op=False)
     
-    sliced_inputs = torch.empty((n, context_length), dtype=torch.int64)
-    sliced_targets = torch.empty((n, context_length), dtype=torch.int64)
+    sliced_inputs = torch.empty((n, context_length), dtype=torch.int64, device=device)
+    sliced_targets = torch.empty((n, context_length), dtype=torch.int64, device=device)
     # warmup
     elapsed_list = []
     elapsed_commu_grad_list = []
@@ -182,8 +182,8 @@ def benchmark_overlap_ddp(rank, world_size, data, warmup):
         ddp_model = DDP(model)
     optimizer = AdamW(model.parameters(), lr=1e-3, betas=betas, eps=1e-8, weight_decay=weight_decay)
 
-    sliced_inputs = torch.empty((n, context_length), dtype=torch.int64)
-    sliced_targets = torch.empty((n, context_length), dtype=torch.int64)
+    sliced_inputs = torch.empty((n, context_length), dtype=torch.int64, device=device)
+    sliced_targets = torch.empty((n, context_length), dtype=torch.int64, device=device)
     # warmup
     elapsed_list = []
     
