@@ -263,7 +263,7 @@ class ShardedOptimizer(optim.Optimizer):
         # param_group["params"] 有可能为 generator，避免被父类消耗掉
         params_list = list(param_group["params"])
         full_group = dict(param_group)
-        full_group["params"] = new_group
+        full_group["params"] = params_list
         optim.Optimizer.add_param_group(self, full_group)
         
         local_group = dict(full_group)
@@ -343,6 +343,9 @@ def benchmark_optimizer(rank, world_size, data, sharded_optimizer=False):
             print(f"rank:{rank} after optimizer step, max memory allocated: {torch.cuda.max_memory_allocated() / 1024 ** 2:.2f} MB")
             print(f"rank:{rank} after optimizer step, current memory allocated: {torch.cuda.memory_allocated() / 1024 ** 2:.2f} MB")
         
+        torch.cuda.synchronize()
+        dist.barrier()
+        dist.destroy_process_group()
     
 if __name__ == "__main__":
     world_size = 2
@@ -358,4 +361,4 @@ if __name__ == "__main__":
     # print(f"overlap ddp: training model with world_size={world_size}, batch_size={batch_size}, context_length={context_length}, d_model={d_model}, num_layers={num_layers}, num_heads={num_heads}, d_ff={d_ff}, rope_theta={rope_theta} on {device} using {world_size} processes")
     # mp.spawn(fn=benchmark_overlap_ddp, args=(world_size, data, warmup), nprocs=world_size, join=True) 
 
-    
+     
