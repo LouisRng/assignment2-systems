@@ -7,13 +7,17 @@ from einops import einsum
 from torch import Tensor
 from jaxtyping import Float, Bool
 import argparse
-from cs336_basics.transformer import cross_entropy, softmax
+from cs336_basics.nn_utils import cross_entropy, softmax, clip_gradient
 from cs336_basics.dataloader import get_batch
-from cs336_basics.optimizer import AdamW, gradient_clipping, lr_schedule 
+from cs336_basics.optimizer import AdamW, lr_schedule 
 
 # args 
 def parse_args(): 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--eos_token_id", type=int, default=256) # 256 -> <|endoftext|>
+    parser.add_argument("--train", type=bool, default=False)
+    parser.add_argument("--from_pretrained", type=str, required=False)
+    parser.add_argument("--save_model", type=bool, default=False)
     # 数据集路径
     parser.add_argument("--train_data", type=str, required=False)
     parser.add_argument("--val_data", type=str, required=False)
@@ -91,73 +95,6 @@ def evaluate(model, val_data, batch_size, context_length, device, n_eval_batches
         total_loss += loss.item() 
     model.train()
     return total_loss / n_eval_batches
-     
-@torch.no_grad()
-def decoding(
-    model, 
-    tokenizer, 
-    prompt: str, 
-    max_token_len: int, 
-    temperature: float, 
-    p: float,
-    device,
-    context_length: int
-):
-    model.eval()
-
-    ids = tokenizer.encode(prompt)
-    ids = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)  # 输入需要有 batch 维度
-
-    # 尝试找 EOS token id
-    try:
-        eot_id = tokenizer.reversed_vocab[b"<|endoftext|>"]
-    except KeyError:
-        eot_id = None 
-
-    generated_ids = []
-    
-    for _ in range(max_token_len):
-        # 截断到 context_length，生产中是用 KV Cache
-        if ids.shape[1] > context_length:
-            input_ids = ids[:, -context_length:]
-        else:
-            input_ids = ids # (1, s, v)
-            
-        logits = model(input_ids)[0, -1, :]     # (v,)
-        
-        probs = softmax(logits, temperature=temperature, dim=-1)
-        
-        # top-p (nucleus) sampling
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True) 
-        cumulative = torch.cumsum(sorted_probs, dim=-1)
-
-        # 找到第一个 cumulative >= p 的位置，保留到这里
-        # nucleus 包括这个位置（"smallest set such that sum >= p"）
-        # 求第一个满足的下标，nonzero 返回非 0 的坐标
-        # item() 会返回 Number 基类，不能直接用
-        cutoff = (cumulative >= p).nonzero()[0].item()          
-        nucleus_probs = sorted_probs[:cutoff + 1]
-        nucleus_indices = sorted_indices[:cutoff + 1]
-        
-        nucleus_probs= nucleus_probs / nucleus_probs.sum()
-        sampled_pos = torch.multinomial(nucleus_probs, num_samples=1)
-        next_id = nucleus_indices[sampled_pos].item()
-
-        # endoftext 切断
-        if eot_id is not None and next_id == eot_id:
-            break
-        
-        # 不要把生成的 token 转换成 str 再拼回去重新 encode，效率非常低下
-        # 直接把生成的 token 拼回 encode 后的 ids
-        generated_ids.append(next_id)
-        ids = torch.cat([ids, torch.tensor([[next_id]], device=device)], dim=1) # (1, s)，沿着 seq_len 维度拼接
-        
-    output_text = tokenizer.decode(generated_ids)
-    print("Prompt:", prompt)
-    print("Generation:", output_text)
-    
-    model.train()
-    return output_text
     
         
 # helpers for benchmarking, 同步设备，确保计时准确
@@ -213,7 +150,7 @@ def warm_up(model, optimizer, train_data, ctx, args, device):
         loss.backward()
     optimizer.step()
     if args.grad_clip > 0:
-        gradient_clipping(model.parameters(), args.grad_clip)
+        clip_gradient(model.parameters(), args.grad_clip)
 
 stats = {"total_size_bytes": 0}
 def pack_hook(t):

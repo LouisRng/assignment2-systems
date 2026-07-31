@@ -5,10 +5,11 @@ from pathlib import Path
 from contextlib import nullcontext
 import timeit 
 from cs336_basics.dataloader import get_batch, save_checkpoint, load_checkpoint
-from cs336_basics.transformer import TransformerLM, cross_entropy, scaled_dot_product_attn
-from cs336_basics.optimizer import AdamW, gradient_clipping, lr_schedule 
+from cs336_basics.model import BasicTransformerLM, scaled_dot_product_attention
+from cs336_basics.nn_utils import cross_entropy, clip_gradient
+from cs336_basics.optimizer import AdamW, lr_schedule 
+from cs336_systems.utils import parse_args, set_seed, load_data, evaluate, sync, benchmarking_print, warm_up, pack_hook, unpack_hook, stats
 from cs336_basics.tokenizer import BPETokenizer
-from cs336_systems.utils import parse_args, set_seed, load_data, evaluate, decoding, sync, benchmarking_print, warm_up, pack_hook, unpack_hook, stats
 
 def attention_benchmark():
     device = "cuda" if torch.cuda.is_available() else \
@@ -20,7 +21,7 @@ def attention_benchmark():
             V = torch.randn(8, seq_len, d_model, device=device, requires_grad=True)
 
             for _ in range(10):  # 预热
-                out = scaled_dot_product_attn(Q, K, V)
+                out = scaled_dot_product_attention(Q, K, V)
                 sync(device)
             
             mem = torch.cuda.memory_allocated()
@@ -29,7 +30,7 @@ def attention_benchmark():
             bwd_elapsed = 0
             for _ in range(100):
                 fwd_start = timeit.default_timer()
-                out = scaled_dot_product_attn(Q, K, V)
+                out = scaled_dot_product_attention(Q, K, V)
                 sync(device)
                 fwd_end = timeit.default_timer()
                 fwd_elapsed += fwd_end - fwd_start 
@@ -63,15 +64,14 @@ def main():
     ckpt_dir = Path("checkpoints") / run_name
     # ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    model = TransformerLM(
+    model = BasicTransformerLM(
         vocab_size=args.vocab_size, 
         context_length=args.context_length, 
-        num_layers=args.num_layers, 
         d_model=args.d_model, 
+        num_layers=args.num_layers, 
         num_heads=args.num_heads, 
         d_ff=args.d_ff, 
         rope_theta=args.rope_theta,
-        use_checkpoint=True
     ).to(device)
     model = torch.compile(model) if args.use_torch_compile else model
     
@@ -141,7 +141,7 @@ def main():
             time_steps.append(timeit.default_timer() - benchmarking_start)
         
         if args.grad_clip > 0:
-            gradient_clipping(model.parameters(), args.grad_clip)
+            clip_gradient(model.parameters(), args.grad_clip)
     
         # with nvtx.range("optimizer"):
         #     optimizer.step()
@@ -169,10 +169,16 @@ def main():
 
     benchmarking_print(args, time_steps) 
     
-    # tokenizer = BPETokenizer.from_files(args.vocab_path, args.merges_path)
+    tokenizer = BPETokenizer.from_files(args.vocab_path, args.merges_path)
 
     if args.generate is not None:
-        decoding(model, tokenizer, args.generate, args.max_token_len, args.temperature, args.p, device=device, context_length=50)
+        print(f"Prompt: {args.generate}")
+        ids = tokenizer.encode(args.generate)
+        ids = torch.tensor(ids, dtype=torch.long)  
+        new_ids = model.generate(ids, args.max_token_len, args.temperature, top_k=None, top_p=args.p, eos_token_id=args.eos_token_id)
+        print(f"new_ids.shape: {new_ids.shape}")
+        generation = tokenizer.decode(new_ids.tolist())
+        print(f"Generation: {generation}")
 
     # save_checkpoint(model, optimizer, args.num_steps, ckpt_dir / "final.pt")
     
